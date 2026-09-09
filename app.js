@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_VERSION = '2026.09.07-ipad-2';
+const APP_VERSION = '2026.09.09-cloud-sync-1';
 const DB_NAME = 'university-study-hub';
 const DB_VERSION = 1;
 const STORES = { meta: 'meta', documents: 'documents', blobs: 'blobs' };
@@ -11,6 +11,7 @@ const els = {};
 let state = null;
 let route = {page:'dashboard', courseId:null, tab:'Overview'};
 let saveTimer = null;
+let stateSavePending = false;
 let toastTimer = null;
 let liveTimer = null;
 let dbPromise = null;
@@ -59,6 +60,129 @@ function dateKey(d){ return localDateKey(d); }
 function parseDateKey(s){ const [y,m,d]=String(s||'').split('-').map(Number); return new Date(y,m-1,d); }
 function downloadBlob(blob,name){ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
 function toast(message, ms=2400){ clearTimeout(toastTimer); els.toast.textContent=message; els.toast.hidden=false; toastTimer=setTimeout(()=>els.toast.hidden=true,ms); }
+
+
+let cloudOfflineBypass = false;
+let cloudChoiceModalOpen = false;
+let cloudConflictModalOpen = false;
+function cloudApi(){ return window.StudyHubCloud || null; }
+function cloudStatus(){ return cloudApi()?.getStatus?.() || {available:false,signedIn:false,phase:'local',message:'Local only'}; }
+function cloudPhaseLabel(s=cloudStatus()){
+  if(!s.available)return '☁ Local';
+  if(!s.signedIn)return '☁ Sign in';
+  if(s.phase==='synced')return '☁ Synced';
+  if(s.phase==='syncing'||s.phase==='pending')return '☁ Syncing';
+  if(s.phase==='offline')return '☁ Offline';
+  if(s.phase==='conflict')return '⚠ Conflict';
+  if(s.phase==='needs-choice')return '⚠ Setup';
+  if(s.phase==='error')return '⚠ Cloud';
+  return '☁ Cloud';
+}
+function updateCloudIndicator(s=cloudStatus()){
+  if(!els.cloudIndicator)return;
+  els.cloudIndicator.textContent=cloudPhaseLabel(s);
+  els.cloudIndicator.dataset.phase=s.phase||'local';
+  els.cloudIndicator.title=s.message||'Cloud sync';
+}
+function showAuthGate(show=true,message='',kind=''){
+  if(!els.authGate)return;
+  els.authGate.hidden=!show;
+  if(show){
+    const msg=els.authMessage; if(msg){msg.textContent=message||'';msg.className=`auth-message ${kind}`.trim();}
+    setTimeout(()=>els.authEmail?.focus(),0);
+  }
+}
+function setAuthBusy(busy){
+  [els.authSignin,els.authSignup,els.authReset].forEach(b=>{if(b)b.disabled=Boolean(busy);});
+}
+async function authSignIn(){
+  const api=cloudApi(); if(!api)return;
+  const email=els.authEmail.value.trim(),password=els.authPassword.value;
+  if(!email||!password)return showAuthGate(true,'Enter your email and password.','error');
+  setAuthBusy(true);showAuthGate(true,'Signing in…');
+  try{await api.signIn(email,password);cloudOfflineBypass=false;showAuthGate(false);}
+  catch(err){showAuthGate(true,err.message||String(err),'error');}
+  finally{setAuthBusy(false);}
+}
+async function authSignUp(){
+  const api=cloudApi(); if(!api)return;
+  const email=els.authEmail.value.trim(),password=els.authPassword.value;
+  if(!email||!password)return showAuthGate(true,'Enter an email and password first.','error');
+  if(password.length<6)return showAuthGate(true,'Use a password of at least 6 characters.','error');
+  setAuthBusy(true);showAuthGate(true,'Creating account…');
+  try{const data=await api.signUp(email,password);if(data?.session){cloudOfflineBypass=false;showAuthGate(false);}else showAuthGate(true,'Account created. Check your email for the Supabase confirmation link, then return here and sign in.','success');}
+  catch(err){showAuthGate(true,err.message||String(err),'error');}
+  finally{setAuthBusy(false);}
+}
+async function authReset(){
+  const api=cloudApi(); if(!api)return;
+  const email=els.authEmail.value.trim(); if(!email)return showAuthGate(true,'Enter your email address first.','error');
+  setAuthBusy(true);
+  try{await api.resetPassword(email);showAuthGate(true,'Password-reset email sent.','success');}
+  catch(err){showAuthGate(true,err.message||String(err),'error');}
+  finally{setAuthBusy(false);}
+}
+async function reloadStateFromDisk(){
+  state=normalizeState(await idbGet(STORES.meta,'state'));
+  const p=activeProfile();
+  if(route.page==='course'&&!p.courses[route.courseId])route={page:'dashboard',courseId:null,tab:'Overview'};
+  render();
+}
+function showInitialCloudChoice(){
+  const api=cloudApi(); if(!api?.getInitialChoice?.()||cloudChoiceModalOpen)return;
+  cloudChoiceModalOpen=true;
+  modal(`<h2>Choose your first cloud copy</h2><p class="card-subtitle">This device already contains University Study Hub data, and this account already has cloud data. Choose which copy should become active on this device.</p><div class="cloud-warning"><strong>Secondary device:</strong> choose <b>Use cloud data</b>.<br><strong>Main device with newer work:</strong> choose <b>Upload this device</b>.</div><div class="action-row" style="margin-top:16px"><button id="cloud-choice-cloud" class="primary-button">Use cloud data</button><button id="cloud-choice-local" class="secondary-button">Upload this device</button></div>`,null,{saveLabel:null});
+  const finish=async which=>{try{toast(which==='cloud'?'Downloading cloud workspace…':'Uploading this device…',4000);await api.chooseInitialSource(which);closeModal();cloudChoiceModalOpen=false;await reloadStateFromDisk();toast('Cloud setup complete.');}catch(err){cloudChoiceModalOpen=false;toast(`Cloud setup failed: ${err.message||err}`,5000);}};
+  document.getElementById('cloud-choice-cloud').onclick=()=>finish('cloud');
+  document.getElementById('cloud-choice-local').onclick=()=>finish('local');
+  document.querySelector('#modal-root [data-modal-cancel]').onclick=()=>{cloudChoiceModalOpen=false;closeModal();};
+}
+function showCloudConflict(){
+  const api=cloudApi(),conflict=api?.getConflict?.(); if(!conflict||cloudConflictModalOpen)return;
+  cloudConflictModalOpen=true;
+  const label=conflict.kind==='document'?'Lecture document':'workspace';
+  modal(`<h2>Cloud sync conflict</h2><p class="card-subtitle">The same ${label} changed on this device and another device before they could synchronize. Nothing will be silently overwritten.</p><div class="cloud-danger">Choose the version you want to keep. Your regular <b>Export full backup</b> remains available in Settings before resolving.</div><div class="action-row" style="margin-top:16px"><button id="cloud-conflict-cloud" class="primary-button">Use cloud version</button><button id="cloud-conflict-local" class="secondary-button">Keep this device</button></div>`,null,{saveLabel:null});
+  const finish=async which=>{try{toast('Resolving cloud conflict…',3500);await api.resolveConflict(which);closeModal();cloudConflictModalOpen=false;await reloadStateFromDisk();toast('Conflict resolved.');}catch(err){cloudConflictModalOpen=false;toast(`Conflict resolution failed: ${err.message||err}`,5000);}};
+  document.getElementById('cloud-conflict-cloud').onclick=()=>finish('cloud');
+  document.getElementById('cloud-conflict-local').onclick=()=>finish('local');
+  document.querySelector('#modal-root [data-modal-cancel]').onclick=()=>{cloudConflictModalOpen=false;closeModal();};
+}
+function cloudSettingsHtml(){
+  const s=cloudStatus(),user=cloudApi()?.getUser?.();
+  const last=s.lastSync?formatDateTime(s.lastSync):'Not synced yet';
+  if(!s.available)return `<section class="card"><div class="card-header"><div><h2>Cloud Sync</h2><div class="card-subtitle">Supabase library is unavailable. The app is still saving locally.</div></div></div></section>`;
+  if(!s.signedIn)return `<section class="card"><div class="card-header"><div><h2>Cloud Sync</h2><div class="card-subtitle">Sign in to automatically keep Windows, Mac and iPad synchronized.</div></div><button id="cloud-open-signin" class="primary-button">Sign in</button></div><p class="form-help">Local/offline saving continues even when you are signed out.</p></section>`;
+  return `<section class="card"><div class="card-header"><div><h2>Cloud Sync</h2><div class="card-subtitle">Automatic local-first synchronization through Supabase</div></div></div>
+    <div class="cloud-status-grid"><div><div class="cloud-status-line"><span class="cloud-status-dot ${escapeHtml(s.phase||'')}"></span><strong>${escapeHtml(s.message||'Cloud')}</strong></div><div class="cloud-account-email">${escapeHtml(user?.email||'')} • Last sync: ${escapeHtml(last)}</div></div><div class="action-row"><button id="cloud-sync-now" class="primary-button">Sync now</button><button id="cloud-signout" class="secondary-button">Sign out</button></div></div>
+    ${s.needsChoice?'<div class="cloud-warning">Cloud and local data both exist on this device. <button id="cloud-resolve-setup" class="secondary-button" style="margin-left:8px">Choose copy</button></div>':''}
+    ${s.conflict?'<div class="cloud-danger">A change conflict is waiting for your choice. <button id="cloud-resolve-conflict" class="secondary-button" style="margin-left:8px">Resolve</button></div>':''}
+    <p class="form-help">Changes save locally first. If the internet drops, they stay queued and upload automatically when the connection returns. PDFs are stored in your private <code>user-files</code> bucket.</p>
+  </section>`;
+}
+function bindCloudSettings(){
+  const api=cloudApi();
+  document.getElementById('cloud-open-signin')?.addEventListener('click',()=>showAuthGate(true));
+  document.getElementById('cloud-sync-now')?.addEventListener('click',async()=>{try{toast('Syncing…');await api?.flushNow?.();renderSettings();}catch(err){toast(`Sync failed: ${err.message||err}`,4500);}});
+  document.getElementById('cloud-signout')?.addEventListener('click',async()=>{if(!confirm('Sign out of cloud sync on this device? Local data will remain here.'))return;try{await api.signOut();renderSettings();showAuthGate(true);}catch(err){toast(`Sign out failed: ${err.message||err}`,4500);}});
+  document.getElementById('cloud-resolve-setup')?.addEventListener('click',showInitialCloudChoice);
+  document.getElementById('cloud-resolve-conflict')?.addEventListener('click',showCloudConflict);
+}
+async function setupCloud(){
+  const api=cloudApi();
+  if(!api){updateCloudIndicator({available:false,phase:'local',message:'Cloud unavailable'});return;}
+  api.onStatus(s=>{
+    updateCloudIndicator(s);
+    if(s.signedIn)showAuthGate(false);
+    else if(s.available&&!cloudOfflineBypass)showAuthGate(true);
+    if(s.needsChoice)setTimeout(showInitialCloudChoice,0);
+    if(s.conflict)setTimeout(showCloudConflict,0);
+    if(route.page==='settings'&&state)setTimeout(()=>{try{renderSettings();}catch(_e){}},0);
+  });
+  window.addEventListener('studyhub-cloud-remote',async()=>{try{await reloadStateFromDisk();toast('Updated from another device.');}catch(err){console.error(err);}});
+  await api.init();
+  const s=api.getStatus();updateCloudIndicator(s);
+  if(s.available&&!s.signedIn&&!cloudOfflineBypass)showAuthGate(true);
+}
 
 
 function bytesToHex(bytes){ return [...bytes].map(b=>b.toString(16).padStart(2,'0')).join(''); }
@@ -178,14 +302,18 @@ async function idbSet(store,key,value){ const db=await openDb(); return new Prom
 async function idbDelete(store,key){ const db=await openDb(); return new Promise((res,rej)=>{ const tx=db.transaction(store,'readwrite'); tx.objectStore(store).delete(key); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); }); }
 async function idbEntries(store){ const db=await openDb(); return new Promise((res,rej)=>{ const tx=db.transaction(store,'readonly'); const s=tx.objectStore(store); const out=[]; const r=s.openCursor(); r.onsuccess=()=>{ const c=r.result; if(!c) return res(out); out.push([c.key,c.value]); c.continue(); }; r.onerror=()=>rej(r.error); }); }
 async function idbClear(store){ const db=await openDb(); return new Promise((res,rej)=>{ const tx=db.transaction(store,'readwrite'); tx.objectStore(store).clear(); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); }); }
-async function loadState(){ state=normalizeState(await idbGet(STORES.meta,'state')); await saveStateNow(false); }
+async function loadState(){ state=normalizeState(await idbGet(STORES.meta,'state')); await saveStateNow(false,false); }
 function queueSave(){
+  stateSavePending=true;
   els.saveIndicator.textContent='Saving…'; els.saveIndicator.style.color='var(--muted)';
-  clearTimeout(saveTimer); saveTimer=setTimeout(()=>saveStateNow(true),180);
+  clearTimeout(saveTimer); saveTimer=setTimeout(()=>saveStateNow(true,true),120);
 }
-async function saveStateNow(show=true){
-  clearTimeout(saveTimer); state.app ||= {}; state.app.last_saved=nowIso(); state.app.version=APP_VERSION;
+async function saveStateNow(show=true,cloudDirty=true){
+  clearTimeout(saveTimer); saveTimer=null;
+  const hadPending=stateSavePending; stateSavePending=false;
+  state.app ||= {}; state.app.last_saved=nowIso(); state.app.version=APP_VERSION;
   await idbSet(STORES.meta,'state',state);
+  if(cloudDirty||hadPending)cloudApi()?.markStateDirty?.().catch(console.error);
   if(show){ els.saveIndicator.textContent='✓ Saved'; els.saveIndicator.style.color='var(--success)'; }
 }
 
@@ -301,13 +429,13 @@ async function createLectureDialog(c){
     const title=root.querySelector('#lecture-title').value.trim()||'Untitled Document'; const materialId=uid('material'); const t=nowIso();
     const material={id:materialId,type:'quill_document',title,file:`browser:${materialId}`,created_at:t,updated_at:t,last_opened_at:t,unit_id:root.querySelector('#lecture-unit').value||null,order:c.materials.length};
     c.materials.push(material); const doc={schema_version:1,id:materialId,title,delta:{ops:[{insert:'\n'}]},slides_attachment:null,editor_layout:{slides_visible:false,split_ratio:.5,slides_scroll_top:0,notes_scroll_top:0,document_format:'normal'},created_at:t,updated_at:t,slide_annotations:{settings:{marker_color:'#2457E6',highlighter_color:'#FFE14F',marker_size:'medium',highlighter_size:'medium',eraser_size:'medium'},strokes:[],texts:[],labels:[]},whiteboard:{exists:false,page_width:1390,page_height:1302,pages_x:1,pages_y:1,scroll_x:0,scroll_y:0,zoom_percent:100,drawings:[],texts:[]},image_occlusion:{reveal_seconds:3,boxes:[]}};
-    await idbSet(STORES.documents,materialId,doc); queueSave(); closeModal(); renderCourse(); await openMaterial(c.id,materialId);
+    await idbSet(STORES.documents,materialId,doc); cloudApi()?.markDocumentDirty?.(materialId).catch(console.error); queueSave(); closeModal(); renderCourse(); await openMaterial(c.id,materialId);
   });
 }
 function unitDialog(c,u=null){ modal(`<h2>${u?'Rename':'Add'} Unit</h2><div class="field"><label>Unit title</label><input id="unit-title" value="${escapeHtml(u?.title||'')}"></div>`,root=>{const title=root.querySelector('#unit-title').value.trim();if(!title)return; if(u)u.title=title; else c.material_units.push({id:uid('unit'),title,collapsed:false,order:c.material_units.length}); queueSave();closeModal();renderCourse();}); }
 async function deleteUnit(c,id){ if(!confirm('Delete this unit? Lectures will move to Ungrouped.'))return;if(!await requireDeletionPin('delete this unit'))return;c.material_units=c.material_units.filter(u=>u.id!==id);for(const m of c.materials)if(m.unit_id===id)m.unit_id=null;queueSave();renderCourse(); }
-async function deleteMaterial(c,id){ const title=c.materials.find(m=>m.id===id)?.title||'this Lecture';if(!confirm(`Delete ${title}? The Lecture document and assigned PDF will be permanently deleted.`))return;if(!await requireDeletionPin(`delete the lecture '${title}'`))return;c.materials=c.materials.filter(m=>m.id!==id);await idbDelete(STORES.documents,id);await idbDelete(STORES.blobs,`pdf:${id}`);queueSave();renderCourse(); }
-async function removeAssignedPdf(c,id){ const doc=await idbGet(STORES.documents,id);if(!doc?.slides_attachment)return toast('This Lecture has no assigned PDF.');const filename=doc.slides_attachment.display_name||'the assigned PDF';if(!confirm(`Remove ${filename} from this Lecture? Notes, questions and the Lecture will stay.`))return;if(!await requireDeletionPin(`remove the assigned PDF '${filename}'`))return;doc.slides_attachment=null;doc.editor_layout={...(doc.editor_layout||{}),slides_visible:false};doc.updated_at=nowIso();await idbSet(STORES.documents,id,doc);await idbDelete(STORES.blobs,`pdf:${id}`);const m=c.materials.find(x=>x.id===id);if(m)m.updated_at=doc.updated_at;queueSave();renderCourse();toast('Assigned PDF removed.'); }
+async function deleteMaterial(c,id){ const title=c.materials.find(m=>m.id===id)?.title||'this Lecture';if(!confirm(`Delete ${title}? The Lecture document and assigned PDF will be permanently deleted.`))return;if(!await requireDeletionPin(`delete the lecture '${title}'`))return;c.materials=c.materials.filter(m=>m.id!==id);await idbDelete(STORES.documents,id);await idbDelete(STORES.blobs,`pdf:${id}`);cloudApi()?.markDocumentDeleted?.(id).catch(console.error);cloudApi()?.markBlobDeleted?.(`pdf:${id}`).catch(console.error);queueSave();renderCourse(); }
+async function removeAssignedPdf(c,id){ const doc=await idbGet(STORES.documents,id);if(!doc?.slides_attachment)return toast('This Lecture has no assigned PDF.');const filename=doc.slides_attachment.display_name||'the assigned PDF';if(!confirm(`Remove ${filename} from this Lecture? Notes, questions and the Lecture will stay.`))return;if(!await requireDeletionPin(`remove the assigned PDF '${filename}'`))return;doc.slides_attachment=null;doc.editor_layout={...(doc.editor_layout||{}),slides_visible:false};doc.updated_at=nowIso();await idbSet(STORES.documents,id,doc);await idbDelete(STORES.blobs,`pdf:${id}`);cloudApi()?.markDocumentDirty?.(id).catch(console.error);cloudApi()?.markBlobDeleted?.(`pdf:${id}`).catch(console.error);const m=c.materials.find(x=>x.id===id);if(m)m.updated_at=doc.updated_at;queueSave();renderCourse();toast('Assigned PDF removed.'); }
 async function openMaterial(courseId,materialId){
   const p=activeProfile(), c=p.courses[courseId], m=c?.materials.find(x=>x.id===materialId); if(!m)return;
   m.last_opened_at=nowIso(); queueSave();
@@ -317,7 +445,7 @@ async function openMaterial(courseId,materialId){
 async function materialTerms(c,id){ const doc=await idbGet(STORES.documents,id); const terms=extractTermRecords(doc?.delta); modal(`<h2>Terms — ${escapeHtml(c.materials.find(m=>m.id===id)?.title||'Lecture')}</h2><div class="list">${terms.length?terms.map(t=>`<div class="list-item"><div class="list-main"><div class="list-title">${escapeHtml(t.text)}</div></div><button class="danger-button" data-delete-term="${escapeHtml(t.id)}">Delete</button></div>`).join(''):'<div class="empty">No + Term highlights saved in this Lecture.</div>'}</div>`,null,{saveLabel:null}); document.querySelectorAll('#modal-root [data-delete-term]').forEach(b=>b.onclick=()=>deleteMaterialTerm(c,id,b.dataset.deleteTerm)); }
 function extractTermRecords(delta){ const grouped=new Map();for(const op of delta?.ops||[]){if(typeof op.insert!=='string'||!op.attributes?.term)continue;const id=String(op.attributes.term),text=op.insert.replace(/\s+/g,' ');grouped.set(id,(grouped.get(id)||'')+text);}return [...grouped.entries()].map(([id,text])=>({id,text:text.trim()})).filter(x=>x.text); }
 function extractTerms(delta){return extractTermRecords(delta).map(x=>x.text);}
-async function deleteMaterialTerm(c,materialId,termId){const doc=await idbGet(STORES.documents,materialId);if(!doc)return;const term=extractTermRecords(doc.delta).find(t=>t.id===termId);if(!term)return;if(!confirm(`Remove this term?\n\n${term.text}\n\nIts light-green highlight will also be removed from the Lecture.`))return;if(!await requireDeletionPin('delete this term'))return;let changed=false;doc.delta={ops:(doc.delta?.ops||[]).map(op=>{if(!op||typeof op!=='object'||String(op.attributes?.term||'')!==termId)return op;const copy={...op},attrs={...(copy.attributes||{})};delete attrs.term;if(Object.keys(attrs).length)copy.attributes=attrs;else delete copy.attributes;changed=true;return copy;})};if(changed){doc.updated_at=nowIso();await idbSet(STORES.documents,materialId,doc);const m=c.materials.find(x=>x.id===materialId);if(m)m.updated_at=doc.updated_at;queueSave();}closeModal();materialTerms(c,materialId);}
+async function deleteMaterialTerm(c,materialId,termId){const doc=await idbGet(STORES.documents,materialId);if(!doc)return;const term=extractTermRecords(doc.delta).find(t=>t.id===termId);if(!term)return;if(!confirm(`Remove this term?\n\n${term.text}\n\nIts light-green highlight will also be removed from the Lecture.`))return;if(!await requireDeletionPin('delete this term'))return;let changed=false;doc.delta={ops:(doc.delta?.ops||[]).map(op=>{if(!op||typeof op!=='object'||String(op.attributes?.term||'')!==termId)return op;const copy={...op},attrs={...(copy.attributes||{})};delete attrs.term;if(Object.keys(attrs).length)copy.attributes=attrs;else delete copy.attributes;changed=true;return copy;})};if(changed){doc.updated_at=nowIso();await idbSet(STORES.documents,materialId,doc);cloudApi()?.markDocumentDirty?.(materialId).catch(console.error);const m=c.materials.find(x=>x.id===materialId);if(m)m.updated_at=doc.updated_at;queueSave();}closeModal();materialTerms(c,materialId);}
 function materialQuiz(c,id){ const qs=c.questions.filter(q=>q.source_material_id===id); modal(`<h2>Lecture Quiz</h2><div class="list">${qs.length?qs.map(q=>questionHtml(q)).join(''):'<div class="empty">No questions have been created from this Lecture.</div>'}</div>`,null,{saveLabel:null,wide:true}); document.querySelectorAll('#modal-root [data-reveal]').forEach(b=>b.onclick=()=>{const value=b.parentElement.querySelector('.answer-value')?.textContent||'';b.textContent=value;b.classList.add('revealed');}); }
 function questionDialog(c){ modal(`<h2>Add Question</h2><div class="form-grid"><div class="field full"><label>Question</label><textarea id="q-prompt"></textarea></div><div class="field full"><label>Answer</label><textarea id="q-answer"></textarea></div></div>`,root=>{const prompt=root.querySelector('#q-prompt').value.trim(),answer=root.querySelector('#q-answer').value.trim();if(!prompt||!answer)return toast('Question and answer are required.'); c.questions.push(questionRecord(prompt,answer));queueSave();closeModal();renderCourse();}); }
 function questionRecord(prompt,answer,extras={}){ const t=nowIso(); return {id:uid('question'),type:'short_answer',prompt,answer,explanation:'',tags:[],created_at:t,updated_at:t,stats:{attempts:0,correct:0,incorrect:0,last_tested:null},...extras}; }
@@ -330,7 +458,7 @@ function eventDialog(c,e=null){
 function courseDialog(c=null){
   modal(`<h2>${c?'Edit':'Add'} Course</h2><div class="form-grid"><div class="field"><label>Course code</label><input id="course-code" value="${escapeHtml(c?.code||'')}"></div><div class="field"><label>Course name (optional)</label><input id="course-name" value="${escapeHtml(c?.name||'')}"></div><div class="field"><label>Banner colour</label><input id="course-color" type="color" value="${escapeHtml(courseColor(c))}"></div></div>`,root=>{const code=normalizeCourseCode(root.querySelector('#course-code').value);if(!code)return toast('Enter a course code.');const p=activeProfile();if(c){c.code=code;c.name=root.querySelector('#course-name').value.trim();c.settings.schedule_box_color=root.querySelector('#course-color').value;c.updated_at=nowIso();}else{const id=uid('course'),t=nowIso();p.courses[id]={id,code,name:root.querySelector('#course-name').value.trim(),created_at:t,updated_at:t,units:[],material_units:[],materials:[],notes:[],questions:[],test_history:[],notifications:[],grading:[],ui_state:{last_tab:'Overview'},settings:{schedule_font_color:'#102010',schedule_box_color:root.querySelector('#course-color').value}};p.course_order.push(id);p.schedule.course_meetings[id]=[];route={page:'course',courseId:id,tab:'Overview'};}queueSave();closeModal();render();});
 }
-function courseMenu(c){ modal(`<h2>${escapeHtml(c.code)}</h2><div class="list"><button id="edit-course" class="list-item"><div class="list-main"><div class="list-title">Edit course</div><div class="list-copy">Code, name and colour</div></div></button><button id="grading-course" class="list-item"><div class="list-main"><div class="list-title">Grading</div><div class="list-copy">Course grading scheme</div></div></button><button id="delete-course" class="list-item"><div class="list-main"><div class="list-title" style="color:var(--danger)">Delete course</div><div class="list-copy">Remove this course from the profile</div></div></button></div>`,null,{saveLabel:null}); document.getElementById('edit-course').onclick=()=>{closeModal();courseDialog(c)}; document.getElementById('grading-course').onclick=()=>{closeModal();gradingDialog(c)}; document.getElementById('delete-course').onclick=async()=>{if(!confirm(`Delete ${c.code}?`))return;if(!await requireDeletionPin(`delete the course '${c.code}'`))return;const p=activeProfile();for(const m of c.materials){await idbDelete(STORES.documents,m.id);await idbDelete(STORES.blobs,`pdf:${m.id}`);}delete p.courses[c.id];p.course_order=p.course_order.filter(id=>id!==c.id);delete p.schedule.course_meetings[c.id];route={page:'dashboard',courseId:null,tab:'Overview'};queueSave();closeModal();render();}; }
+function courseMenu(c){ modal(`<h2>${escapeHtml(c.code)}</h2><div class="list"><button id="edit-course" class="list-item"><div class="list-main"><div class="list-title">Edit course</div><div class="list-copy">Code, name and colour</div></div></button><button id="grading-course" class="list-item"><div class="list-main"><div class="list-title">Grading</div><div class="list-copy">Course grading scheme</div></div></button><button id="delete-course" class="list-item"><div class="list-main"><div class="list-title" style="color:var(--danger)">Delete course</div><div class="list-copy">Remove this course from the profile</div></div></button></div>`,null,{saveLabel:null}); document.getElementById('edit-course').onclick=()=>{closeModal();courseDialog(c)}; document.getElementById('grading-course').onclick=()=>{closeModal();gradingDialog(c)}; document.getElementById('delete-course').onclick=async()=>{if(!confirm(`Delete ${c.code}?`))return;if(!await requireDeletionPin(`delete the course '${c.code}'`))return;const p=activeProfile();for(const m of c.materials){await idbDelete(STORES.documents,m.id);await idbDelete(STORES.blobs,`pdf:${m.id}`);cloudApi()?.markDocumentDeleted?.(m.id).catch(console.error);cloudApi()?.markBlobDeleted?.(`pdf:${m.id}`).catch(console.error);}delete p.courses[c.id];p.course_order=p.course_order.filter(id=>id!==c.id);delete p.schedule.course_meetings[c.id];route={page:'dashboard',courseId:null,tab:'Overview'};queueSave();closeModal();render();}; }
 function gradingDialog(c){
   const rows=(c.grading||[]).map(g=>gradingRow(g.name,g.weight,g.id)).join('');
   modal(`<h2>Grading Scheme — ${escapeHtml(c.code)}</h2><div id="grading-rows" class="list">${rows}</div><button id="add-grade-row" class="secondary-button" style="margin-top:10px">＋ Category</button><div class="form-help" id="grading-total"></div>`,root=>{const out=[];root.querySelectorAll('.grading-row').forEach(r=>{const name=r.querySelector('[data-name]').value.trim();const weight=Number(r.querySelector('[data-weight]').value);if(name&&Number.isFinite(weight))out.push({id:r.dataset.id||uid('grade'),name,weight});});c.grading=out;queueSave();closeModal();renderCourse();},{wide:true});
@@ -400,42 +528,47 @@ function renderSettings(){ const p=activeProfile(),a=p.settings.audio||{}; setHe
   <section class="card"><div class="card-header"><div><h2>User settings</h2><div class="card-subtitle">Cross-platform interaction preferences</div></div></div><div class="settings-row"><div><strong>Scroll sensitivity</strong><span>Changes scroll speed throughout supported pages.</span></div><select id="scroll-sensitivity">${SCROLL_LEVELS.map(v=>`<option value="${v}" ${p.settings.scroll_sensitivity===v?'selected':''}>${v}%</option>`).join('')}</select></div><div class="settings-row"><div><strong>Deletion PIN</strong><span>${deletionPinConfigured(p)?'Protects deletion actions with your existing desktop-compatible PIN.':'Set a 1–6 digit PIN before protected deletions.'}</span></div><button id="change-deletion-pin" class="secondary-button">${deletionPinConfigured(p)?'Change PIN':'Set PIN'}</button></div></section>
   <section class="card"><div class="card-header"><h2>Appearance</h2></div><div class="settings-row"><div><strong>Theme</strong><span>The shared interface currently preserves the dark University Study Hub design.</span></div><select id="theme-select"><option>Dark</option></select></div></section>
   <section class="card"><div class="card-header"><h2>Audio</h2></div><div class="settings-row"><div><strong>Study music</strong><span>Uses the same bundled music on Windows, Mac and iPad.</span></div><label><input id="music-enabled" type="checkbox" ${a.music_enabled?'checked':''}> Enabled</label></div><div class="settings-row"><div><strong>Track</strong></div><select id="music-track"><option value="${MUSIC_TRACKS[0]}" ${(a.music_track||MUSIC_TRACKS[0])===MUSIC_TRACKS[0]?'selected':''}>Study Jazz</option><option value="${MUSIC_TRACKS[1]}" ${a.music_track===MUSIC_TRACKS[1]?'selected':''}>Study Session</option></select></div><div class="settings-row"><div><strong>Shuffle</strong><span>Choose another bundled track when a track finishes.</span></div><label><input id="music-shuffle" type="checkbox" ${a.shuffle?'checked':''}> Enabled</label></div><div class="settings-row"><div><strong>Music volume</strong></div><input id="music-volume" type="range" min="0" max="1" step="0.01" value="${Number(a.music_volume??.3)}"></div><div class="settings-row"><div><strong>Click sounds</strong></div><label><input id="click-enabled" type="checkbox" ${a.click_enabled?'checked':''}> Enabled</label></div></section>
+  ${cloudSettingsHtml()}
   <section class="card"><div class="card-header"><div><h2>Data & device transfer</h2><div class="card-subtitle">Move the same University Study Hub data between Windows, Mac and iPad.</div></div></div><div class="action-row"><button id="export-transfer" class="primary-button">Export full backup</button><button id="import-transfer" class="secondary-button">Import backup</button></div><p class="form-help">Backups include profiles, courses, Lecture documents, annotations and imported PDFs stored by this shared version.</p></section>
   <section class="card"><div class="card-header"><div><h2>iPad installation</h2><div class="card-subtitle">No App Store required</div></div></div><ol style="line-height:1.7;color:var(--muted)"><li>Open the hosted Study Hub address in Safari.</li><li>Tap Share → Add to Home Screen.</li><li>Open the new Study Hub icon. It runs as a standalone iPad app.</li><li>Use Import backup to bring over your desktop data.</li></ol><p class="form-help">Once installed and cached, the core app and Lecture editor work offline. OCR may require internet the first time its engine is loaded.</p></section>
   </div>`;
-  document.getElementById('scroll-sensitivity').onchange=e=>{p.settings.scroll_sensitivity=Number(e.target.value);queueSave();applySettings();};document.getElementById('change-deletion-pin').onclick=changeDeletionPin;document.getElementById('music-enabled').onchange=e=>{a.music_enabled=e.target.checked;queueSave();applyAudio();};document.getElementById('music-track').onchange=e=>{a.music_track=e.target.value;if(audioTrack){audioTrack.pause();audioTrack=null;}queueSave();applyAudio();};document.getElementById('music-shuffle').onchange=e=>{a.shuffle=e.target.checked;queueSave();};document.getElementById('music-volume').oninput=e=>{a.music_volume=Number(e.target.value);queueSave();if(audioTrack)audioTrack.volume=a.music_volume;};document.getElementById('click-enabled').onchange=e=>{a.click_enabled=e.target.checked;queueSave();};document.getElementById('export-transfer').onclick=exportTransfer;document.getElementById('import-transfer').onclick=()=>els.transferImport.click();
+  document.getElementById('scroll-sensitivity').onchange=e=>{p.settings.scroll_sensitivity=Number(e.target.value);queueSave();applySettings();};document.getElementById('change-deletion-pin').onclick=changeDeletionPin;document.getElementById('music-enabled').onchange=e=>{a.music_enabled=e.target.checked;queueSave();applyAudio();};document.getElementById('music-track').onchange=e=>{a.music_track=e.target.value;if(audioTrack){audioTrack.pause();audioTrack=null;}queueSave();applyAudio();};document.getElementById('music-shuffle').onchange=e=>{a.shuffle=e.target.checked;queueSave();};document.getElementById('music-volume').oninput=e=>{a.music_volume=Number(e.target.value);queueSave();if(audioTrack)audioTrack.volume=a.music_volume;};document.getElementById('click-enabled').onchange=e=>{a.click_enabled=e.target.checked;queueSave();};document.getElementById('export-transfer').onclick=exportTransfer;document.getElementById('import-transfer').onclick=()=>els.transferImport.click();bindCloudSettings();
 }
 function applySettings(){ const p=activeProfile();document.documentElement.style.setProperty('--scroll-factor',String((p.settings.scroll_sensitivity||100)/100));applyAudio(); }
 function applyAudio(){ const a=activeProfile().settings.audio||{}; const track=MUSIC_TRACKS.includes(a.music_track)?a.music_track:MUSIC_TRACKS[0]; if(a.music_track!==track)a.music_track=track; if(a.music_enabled){ if(!audioTrack){audioTrack=new Audio(`audio/music/${encodeURIComponent(track)}`);audioTrack.loop=!a.shuffle;audioTrack.addEventListener('ended',()=>{if(!a.shuffle)return;const choices=MUSIC_TRACKS.filter(x=>x!==a.music_track);a.music_track=choices[Math.floor(Math.random()*choices.length)]||MUSIC_TRACKS[0];audioTrack=null;queueSave();applyAudio();});}audioTrack.volume=Number(a.music_volume??.3);if(a.music_paused!==true)audioTrack.play().catch(()=>{});}else if(audioTrack){audioTrack.pause();} }
 function clickSound(){ const a=activeProfile().settings.audio||{}; if(!a.click_enabled)return;const au=new Audio('audio/clicks/matthewvakaliuk73627-mouse-click-290204.mp3');au.volume=Number(a.click_volume??.55);au.play().catch(()=>{}); }
 
 async function exportTransfer(){
-  await saveStateNow(false); const docs=Object.fromEntries(await idbEntries(STORES.documents)); const blobs={}; for(const [key,blob] of await idbEntries(STORES.blobs)){ if(blob instanceof Blob) blobs[key]={name:blob.name||`${key}.bin`,type:blob.type||'application/octet-stream',base64:await blobToBase64(blob)}; }
+  await saveStateNow(false,false); const docs=Object.fromEntries(await idbEntries(STORES.documents)); const blobs={}; for(const [key,blob] of await idbEntries(STORES.blobs)){ if(blob instanceof Blob) blobs[key]={name:blob.name||`${key}.bin`,type:blob.type||'application/octet-stream',base64:await blobToBase64(blob)}; }
   const payload={format:'university-study-hub-transfer',version:1,created_at:nowIso(),state,documents:docs,blobs}; downloadBlob(new Blob([JSON.stringify(payload)],{type:'application/json'}),`University_Study_Hub_Backup_${localDateKey()}.ushub.json`);toast('Full backup exported.');
 }
 function blobToBase64(blob){ return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=()=>rej(r.error);r.readAsDataURL(blob);}); }
 function base64ToBlob(base64,type){ const bin=atob(base64),len=bin.length,arr=new Uint8Array(len);for(let i=0;i<len;i++)arr[i]=bin.charCodeAt(i);return new Blob([arr],{type:type||'application/octet-stream'}); }
 async function importTransferFile(file){
-  try{const payload=JSON.parse(await file.text()); if(payload.format!=='university-study-hub-transfer'&&!payload.profiles)throw new Error('This is not a University Study Hub backup.'); if(payload.state){state=normalizeState(payload.state);await idbClear(STORES.documents);await idbClear(STORES.blobs);for(const [k,v] of Object.entries(payload.documents||{}))await idbSet(STORES.documents,k,v);for(const [k,v] of Object.entries(payload.blobs||{}))await idbSet(STORES.blobs,k,base64ToBlob(v.base64,v.type));}else state=normalizeState(payload);await saveStateNow();route={page:'dashboard',courseId:null,tab:'Overview'};render();toast('Backup imported successfully.');}catch(err){console.error(err);toast(`Import failed: ${err.message||err}`,4500);}finally{els.transferImport.value='';}
+  try{const payload=JSON.parse(await file.text()); if(payload.format!=='university-study-hub-transfer'&&!payload.profiles)throw new Error('This is not a University Study Hub backup.'); if(payload.state){state=normalizeState(payload.state);await idbClear(STORES.documents);await idbClear(STORES.blobs);for(const [k,v] of Object.entries(payload.documents||{}))await idbSet(STORES.documents,k,v);for(const [k,v] of Object.entries(payload.blobs||{}))await idbSet(STORES.blobs,k,base64ToBlob(v.base64,v.type));}else state=normalizeState(payload);await saveStateNow(false,false);await cloudApi()?.markEverythingDirty?.();route={page:'dashboard',courseId:null,tab:'Overview'};render();toast(cloudStatus().signedIn?'Backup imported; cloud upload queued.':'Backup imported successfully.');}catch(err){console.error(err);toast(`Import failed: ${err.message||err}`,4500);}finally{els.transferImport.value='';}
 }
 
-function profileManager(){ const profiles=Object.values(state.profiles); modal(`<h2>Profiles</h2><div class="list">${profiles.map(p=>`<div class="list-item"><div class="list-main"><div class="list-title">${escapeHtml(p.display_name)}</div></div><button class="secondary-button" data-profile-rename="${p.id}">Rename</button>${profiles.length>1?`<button class="danger-button" data-profile-delete="${p.id}">Delete</button>`:''}</div>`).join('')}</div><button id="profile-add" class="secondary-button" style="margin-top:10px">＋ Profile</button>`,null,{saveLabel:null});const root=document.getElementById('modal-root');root.querySelector('#profile-add').onclick=()=>{const name=prompt('Profile name','New Profile');if(!name)return;const p=defaultProfile(name.trim());state.profiles[p.id]=p;state.active_profile_id=p.id;route={page:'dashboard',courseId:null,tab:'Overview'};queueSave();closeModal();render();};root.querySelectorAll('[data-profile-rename]').forEach(b=>b.onclick=()=>{const p=state.profiles[b.dataset.profileRename],n=prompt('Profile name',p.display_name);if(n){p.display_name=n.trim()||p.display_name;queueSave();closeModal();render();}});root.querySelectorAll('[data-profile-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete this profile and all of its shared-version data?'))return;if(!await requireDeletionPin('delete this profile'))return;delete state.profiles[b.dataset.profileDelete];state.active_profile_id=Object.keys(state.profiles)[0];route={page:'dashboard',courseId:null,tab:'Overview'};queueSave();closeModal();render();}); }
+function profileManager(){ const profiles=Object.values(state.profiles); modal(`<h2>Profiles</h2><div class="list">${profiles.map(p=>`<div class="list-item"><div class="list-main"><div class="list-title">${escapeHtml(p.display_name)}</div></div><button class="secondary-button" data-profile-rename="${p.id}">Rename</button>${profiles.length>1?`<button class="danger-button" data-profile-delete="${p.id}">Delete</button>`:''}</div>`).join('')}</div><button id="profile-add" class="secondary-button" style="margin-top:10px">＋ Profile</button>`,null,{saveLabel:null});const root=document.getElementById('modal-root');root.querySelector('#profile-add').onclick=()=>{const name=prompt('Profile name','New Profile');if(!name)return;const p=defaultProfile(name.trim());state.profiles[p.id]=p;state.active_profile_id=p.id;route={page:'dashboard',courseId:null,tab:'Overview'};queueSave();closeModal();render();};root.querySelectorAll('[data-profile-rename]').forEach(b=>b.onclick=()=>{const p=state.profiles[b.dataset.profileRename],n=prompt('Profile name',p.display_name);if(n){p.display_name=n.trim()||p.display_name;queueSave();closeModal();render();}});root.querySelectorAll('[data-profile-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete this profile and all of its shared-version data?'))return;if(!await requireDeletionPin('delete this profile'))return;const doomed=state.profiles[b.dataset.profileDelete];for(const course of Object.values(doomed?.courses||{})){for(const m of course.materials||[]){await idbDelete(STORES.documents,m.id);await idbDelete(STORES.blobs,`pdf:${m.id}`);cloudApi()?.markDocumentDeleted?.(m.id).catch(console.error);cloudApi()?.markBlobDeleted?.(`pdf:${m.id}`).catch(console.error);}}delete state.profiles[b.dataset.profileDelete];state.active_profile_id=Object.keys(state.profiles)[0];route={page:'dashboard',courseId:null,tab:'Overview'};queueSave();closeModal();render();}); }
 
 function modal(content,onSave,opts={}){ const saveLabel=opts.saveLabel===undefined?'Save':opts.saveLabel; els.modalRoot.innerHTML=`<div class="modal-backdrop"><div class="modal ${opts.wide?'wide':''}">${content}<div class="modal-actions"><button class="secondary-button" data-modal-cancel>${saveLabel? 'Cancel':'Close'}</button>${saveLabel?`<button class="primary-button" data-modal-save>${escapeHtml(saveLabel)}</button>`:''}</div></div></div>`; const root=els.modalRoot;root.querySelector('[data-modal-cancel]').onclick=closeModal;if(saveLabel&&onSave)root.querySelector('[data-modal-save]').onclick=()=>onSave(root);root.querySelector('.modal-backdrop').addEventListener('pointerdown',e=>{if(e.target===e.currentTarget)closeModal();});setTimeout(()=>root.querySelector('input,textarea,select')?.focus(),0); }
 function closeModal(){ els.modalRoot.innerHTML=''; }
 
 async function init(){
-  Object.assign(els,{sidebar:document.getElementById('sidebar'),scrim:document.getElementById('scrim'),primaryNav:document.getElementById('primary-nav'),courseNav:document.getElementById('course-nav'),profileSelect:document.getElementById('profile-select'),page:document.getElementById('page'),pageTitle:document.getElementById('page-title'),pageSubtitle:document.getElementById('page-subtitle'),saveIndicator:document.getElementById('save-indicator'),modalRoot:document.getElementById('modal-root'),toast:document.getElementById('toast'),transferImport:document.getElementById('transfer-import'),scheduleImageImport:document.getElementById('schedule-image-import')});
+  Object.assign(els,{sidebar:document.getElementById('sidebar'),scrim:document.getElementById('scrim'),primaryNav:document.getElementById('primary-nav'),courseNav:document.getElementById('course-nav'),profileSelect:document.getElementById('profile-select'),page:document.getElementById('page'),pageTitle:document.getElementById('page-title'),pageSubtitle:document.getElementById('page-subtitle'),saveIndicator:document.getElementById('save-indicator'),modalRoot:document.getElementById('modal-root'),toast:document.getElementById('toast'),transferImport:document.getElementById('transfer-import'),scheduleImageImport:document.getElementById('schedule-image-import'),cloudIndicator:document.getElementById('cloud-indicator'),authGate:document.getElementById('auth-gate'),authEmail:document.getElementById('auth-email'),authPassword:document.getElementById('auth-password'),authMessage:document.getElementById('auth-message'),authSignin:document.getElementById('auth-signin'),authSignup:document.getElementById('auth-signup'),authReset:document.getElementById('auth-reset'),authOffline:document.getElementById('auth-offline')});
   await loadState(); const p=activeProfile(); route.page=(p.ui_state?.last_page||'Dashboard').toLowerCase().replace(' ','_'); if(!['dashboard','notes','schedule','settings','course'].includes(route.page))route.page='dashboard'; route.courseId=p.ui_state?.last_course_id||null;if(route.page==='course'&&!p.courses[route.courseId])route.page='dashboard';route.tab=route.courseId?p.courses[route.courseId]?.ui_state?.last_tab||'Overview':'Overview';
   document.getElementById('sidebar-open').onclick=openNav;document.getElementById('sidebar-close').onclick=closeNav;els.scrim.onclick=closeNav;
   els.primaryNav.addEventListener('click',e=>{const b=e.target.closest('[data-nav]');if(b)navTo(b.dataset.nav);});els.courseNav.addEventListener('click',e=>{const b=e.target.closest('[data-course]');if(b)navTo('course',{courseId:b.dataset.course,tab:activeProfile().courses[b.dataset.course].ui_state?.last_tab||'Overview'});});document.getElementById('add-course-nav').onclick=()=>courseDialog();document.getElementById('global-add').onclick=()=>route.page==='course'?createLectureDialog(activeCourse()):courseDialog();
   els.profileSelect.onchange=()=>{state.active_profile_id=els.profileSelect.value;const p=activeProfile();route={page:'dashboard',courseId:p.ui_state?.last_course_id||null,tab:'Overview'};queueSave();render();};document.getElementById('manage-profiles').onclick=profileManager;
   els.transferImport.onchange=()=>importTransferFile(els.transferImport.files?.[0]);els.scheduleImageImport.onchange=()=>{const f=els.scheduleImageImport.files?.[0];els.scheduleImageImport.value='';if(f)handleScheduleImage(f);};
   document.addEventListener('click',e=>{if(e.target.closest('button,.nav-item,.course-nav-item'))clickSound();});
-  window.addEventListener('beforeunload',()=>saveStateNow(false));
+  els.cloudIndicator.onclick=()=>navTo('settings');els.authSignin.onclick=authSignIn;els.authSignup.onclick=authSignUp;els.authReset.onclick=authReset;els.authOffline.onclick=()=>{cloudOfflineBypass=true;showAuthGate(false);toast('Working locally. Sign in from Settings whenever you want cloud sync.');};els.authPassword.addEventListener('keydown',e=>{if(e.key==='Enter')authSignIn();});
+  window.addEventListener('pagehide',()=>{if(stateSavePending)saveStateNow(false,true).catch(()=>{});});
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&stateSavePending)saveStateNow(false,true).catch(()=>{});});
+  window.addEventListener('beforeunload',()=>{if(stateSavePending)saveStateNow(false,true).catch(()=>{});});
   window.addEventListener('pageshow',async event=>{if(event.persisted&&state){state=normalizeState(await idbGet(STORES.meta,'state'));render();}});
   if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('service-worker.js').catch(console.warn);
   render();
+  setupCloud().catch(err=>{console.error(err);toast(`Cloud startup failed: ${err.message||err}`,4500);});
 }
 
 document.addEventListener('DOMContentLoaded',init);
