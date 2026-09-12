@@ -1,0 +1,10 @@
+University Study Hub v28 — upload these files preserving these exact repository paths:
+
+/index.html
+/service-worker.js
+/study_material_reorder.js
+/editor/editor_bootstrap.html
+/editor/editor_enhancements.js
+
+Built from GitHub main commit 64bf05d52ea014a96a626e2cad9fe451ab3195cb.
+Do not delete or replace app.js or editor/editor.html for this update.
