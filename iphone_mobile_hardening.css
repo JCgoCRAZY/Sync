@@ -1,0 +1,295 @@
+/* University Study Hub — iPhone/mobile hardening v36 */
+
+/* The mobile navigation scrim must NEVER intercept the app while hidden.
+   This explicit author-level rule avoids Safari/PWA differences around the
+   HTML hidden attribute versus the mobile .scrim { display:block } rule. */
+.scrim[hidden] {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+body:not(.nav-open) .scrim {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+body.nav-open .scrim:not([hidden]) {
+  display: block !important;
+  visibility: visible !important;
+  pointer-events: auto !important;
+}
+
+@media (max-width: 700px), (pointer: coarse) and (max-width: 700px) {
+  html,
+  body {
+    width: 100%;
+    max-width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  body {
+    overscroll-behavior: none;
+  }
+
+  #app,
+  .app-shell {
+    width: 100%;
+    max-width: 100vw;
+    height: 100dvh;
+    min-height: 0 !important;
+    overflow: hidden !important;
+  }
+
+  .main-shell {
+    width: 100%;
+    max-width: 100vw;
+    height: 100dvh;
+    min-width: 0;
+    min-height: 0 !important;
+    overflow: hidden !important;
+  }
+
+  /* This is the actual iPhone scrolling surface. The missing min-height:0 is
+     important on Safari grid layouts: without it the grid child can grow past
+     the viewport and then get clipped by .main-shell instead of scrolling. */
+  .page {
+    width: 100%;
+    max-width: 100vw;
+    height: 100%;
+    min-width: 0;
+    min-height: 0 !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+    overscroll-behavior-x: none;
+    overscroll-behavior-y: contain;
+    scroll-behavior: auto;
+    padding:
+      14px
+      max(12px, env(safe-area-inset-right))
+      calc(24px + env(safe-area-inset-bottom))
+      max(12px, env(safe-area-inset-left));
+  }
+
+  .page-stack,
+  .dashboard-upgrade,
+  .page-stack > *,
+  .card,
+  .card-header,
+  .grid-2,
+  .grid-3,
+  .stat-row,
+  .list,
+  .list-item,
+  .list-main {
+    min-width: 0 !important;
+    max-width: 100%;
+  }
+
+  .page-stack,
+  .dashboard-upgrade,
+  .card {
+    width: 100%;
+  }
+
+  /* Compact mobile header that cannot force the document wider than the phone. */
+  .top-header {
+    width: 100%;
+    max-width: 100vw;
+    min-width: 0;
+    display: grid !important;
+    grid-template-columns: 44px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 7px;
+    overflow: hidden;
+    padding:
+      calc(10px + env(safe-area-inset-top))
+      max(10px, env(safe-area-inset-right))
+      28px
+      max(10px, env(safe-area-inset-left));
+  }
+
+  #sidebar-open {
+    width: 44px;
+    min-width: 44px;
+    padding: 0;
+  }
+
+  .heading-wrap {
+    min-width: 0 !important;
+    overflow: hidden;
+  }
+
+  .heading-wrap h1 {
+    max-width: 100%;
+    margin: 0;
+    font-size: clamp(18px, 5.4vw, 23px) !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .heading-wrap p {
+    max-width: 100%;
+    font-size: 11px !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .header-actions {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 5px;
+    overflow: hidden;
+  }
+
+  #cloud-indicator {
+    min-width: 0;
+    max-width: 92px !important;
+    padding: 7px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  #global-add {
+    flex: 0 0 40px;
+    width: 40px;
+    min-width: 40px;
+    padding: 0;
+  }
+
+  .deployment-version-group {
+    left: 50% !important;
+    right: auto !important;
+    top: auto !important;
+    bottom: 4px !important;
+    width: auto !important;
+    max-width: calc(100vw - 24px);
+    transform: translateX(-50%) !important;
+    overflow: hidden;
+  }
+
+  .deployment-version-group .deployment-version-top {
+    max-width: calc(100vw - 24px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 10px !important;
+    white-space: nowrap;
+  }
+
+  /* Dashboard: stop the countdown and action buttons from forcing cards wider
+     than the viewport. */
+  .dashboard-upgrade > .card:first-child .card-header {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  #dashboard-clock {
+    justify-self: start;
+    max-width: 100%;
+    font-size: clamp(26px, 9vw, 36px) !important;
+    line-height: 1.05;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dashboard-upcoming-event {
+    display: grid !important;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center !important;
+    gap: 10px;
+    width: 100%;
+  }
+
+  .dashboard-upcoming-event > .secondary-button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .today-classes-row {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto !important;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x;
+  }
+
+  .today-class {
+    max-width: calc(100vw - 54px);
+  }
+
+  .dashboard-upgrade .grid-3 {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .course-accent-card {
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .course-accent-card .stat-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  .card-header {
+    flex-wrap: wrap;
+  }
+
+  .card-header > * {
+    min-width: 0;
+  }
+
+  .card-header .primary-button,
+  .card-header .secondary-button {
+    max-width: 100%;
+  }
+
+  /* Long settings/status content should wrap rather than widen the viewport. */
+  .settings-row,
+  .cloud-status-grid,
+  .sync-save-state-grid,
+  .sync-diag-grid,
+  .device-row {
+    min-width: 0 !important;
+    max-width: 100%;
+  }
+
+  .settings-row span,
+  .settings-row strong,
+  .cloud-account-email,
+  .list-title,
+  .list-copy {
+    overflow-wrap: anywhere;
+  }
+
+  .modal-backdrop {
+    width: 100vw;
+    height: 100dvh;
+    padding:
+      max(12px, env(safe-area-inset-top))
+      max(10px, env(safe-area-inset-right))
+      max(12px, env(safe-area-inset-bottom))
+      max(10px, env(safe-area-inset-left));
+  }
+
+  .modal {
+    width: 100%;
+    max-width: 100%;
+    max-height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 24px);
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+  }
+}
